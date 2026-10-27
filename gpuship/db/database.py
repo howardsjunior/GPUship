@@ -18,6 +18,9 @@ def init_db():
     global _initialized
     with _lock:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=20.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
         cursor = conn.cursor()
         
         # 1. Services table
@@ -122,6 +125,7 @@ def get_connection() -> sqlite3.Connection:
     if not _initialized:
         init_db()
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=20.0)
+    conn.execute("PRAGMA busy_timeout=5000;")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -291,6 +295,21 @@ def list_pods_for_service(service_id: str, limit: int = 20) -> List[Pod]:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM pods WHERE service_id = ? ORDER BY rented_at DESC LIMIT ?", (service_id, limit))
+    rows = cursor.fetchall()
+    conn.close()
+    pods = []
+    for r in rows:
+        d = dict(r)
+        d["state"] = PodState(d["state"])
+        d["cold_start"] = ColdStartBreakdown(**json.loads(d["cold_start_json"]))
+        del d["cold_start_json"]
+        pods.append(Pod(**d))
+    return pods
+
+def list_all_unreleased_pods() -> List[Pod]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM pods WHERE state != 'TERMINATED'")
     rows = cursor.fetchall()
     conn.close()
     pods = []

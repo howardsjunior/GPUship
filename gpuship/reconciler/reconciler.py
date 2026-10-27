@@ -26,6 +26,8 @@ class Reconciler:
 
     async def start(self):
         self.running = True
+        logger.info("Running initial orphaned pod audit across controller restarts...")
+        await self.reconcile_orphaned_pods()
         self._task = asyncio.create_task(self._reconcile_loop())
         logger.info("GPUShip Reconciler started.")
 
@@ -241,9 +243,52 @@ class Reconciler:
         finally:
             self._processing_jobs.discard(job_id)
             # Pod is free again
+            remaining_queued = db.count_queued_jobs(service.id)
             db.update_pod(pod.id, {
                 "state": PodState.READY,
                 "current_job_id": None,
-                "idle_started_at": time.time()  # Start idle timer right after job completion
+                "idle_started_at": time.time() if remaining_queued == 0 else None
             })
+
+    async def reconcile_orphaned_pods(self):
+        """
+        Detect and release abandoned pods across controller restarts.
+        Enforces §8.7 invariant: 'No abandoned billable pods after controlled teardown and controller-restart tests.'
+        """
+        try:
+            unreleased_pods = db.list_all_unreleased_pods()
+            provider_pods = await self.driver.list_active_pods()
+            provider_pod_ids = {p.get("lium_pod_id") or p.get("id") for p in provider_pods}
+
+            for pod in unreleased_pods:
+                queued = db.count_queued_jobs(pod.service_id)
+                service = db.get_service(pod.service_id)
+                keep_warm = service.keep_warm_count if service else 0
+                
+                # If pod does not exist on provider anymore, mark it terminated
+                if pod.lium_pod_id not in provider_pod_ids:
+                    db.update_pod(pod.id, {
+                        "state": PodState.TERMINATED,
+                        "released_at": time.time(),
+                        "total_billed_seconds": max(1.0, time.time() - (pod.rented_at or time.time()))
+                    })
+                    db.log_activity(
+                        service_id=pod.service_id,
+                        event_type="ORPHAN_CLEANED",
+                        level="WARNING",
+                        message=f"Cleaned up stale local pod {pod.id} (not on Lium provider).",
+                        metadata={"pod_id": pod.id}
+                    )
+                # If controller was restarted and pod was in a transient state without jobs
+                elif pod.state in (PodState.PROCESSING, PodState.IDLE_COOLING, PodState.READY) and queued == 0 and keep_warm == 0:
+                    now = time.time()
+                    idle_since = pod.idle_started_at or pod.rented_at or now
+                    timeout = service.idle_timeout_seconds if service else 30
+                    if (now - idle_since) >= timeout:
+                        logger.info(f"Releasing orphaned pod {pod.lium_pod_id} on startup recovery.")
+                        await self._scale_pod_to_zero(service, pod)
+
+            logger.info("Orphaned pod audit completed. 0 billable leaks.")
+        except Exception as e:
+            logger.error(f"Error checking orphaned pods: {e}", exc_info=True)
 

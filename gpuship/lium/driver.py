@@ -56,6 +56,21 @@ class LiumDriver:
         else:
             return await self._simulated_get_status(lium_pod_id)
 
+    async def list_active_pods(self) -> List[Dict[str, Any]]:
+        """
+        List all active non-terminated pods currently on Lium.
+        Used by the orphaned pod reconciler to prevent billable leaks.
+        """
+        if not self.simulation and self.api_key:
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                res = await client.get(f"{self.api_url}/pods", headers=headers)
+                if res.status_code == 200:
+                    return res.json().get("pods", [])
+                return []
+        else:
+            return [p for p in self._simulated_pods.values() if p.get("state") != PodState.TERMINATED]
+
     async def execute_inference(self, lium_pod_id: str, payload: Dict[str, Any], workload_type: str = "whisper") -> Dict[str, Any]:
         """
         Send an inference job to the worker running on the pod.

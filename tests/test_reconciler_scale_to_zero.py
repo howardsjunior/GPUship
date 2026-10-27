@@ -45,17 +45,17 @@ class TestReconcilerScaleToZero(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(active_pod)
         self.assertEqual(active_pod.state, PodState.PROVISIONING)
 
-        # 3. Simulate passage of time for provisioning -> booting -> loading -> ready
-        for _ in range(10):
-            await asyncio.sleep(0.08)
+        # 3. Simulate passage of time for provisioning -> booting -> loading -> ready -> executed
+        completed_job = None
+        for _ in range(30):
+            await asyncio.sleep(0.05)
             await self.reconciler._reconcile_service(self.service)
-            pod = db.get_active_pod_for_service(self.service_id)
-            if pod and pod.state == PodState.READY:
+            current = db.get_job(job.id)
+            if current and current.status == JobStatus.SUCCEEDED:
+                completed_job = current
                 break
 
-        # Let the job dispatch and execute
-        await asyncio.sleep(0.2)
-        completed_job = db.get_job(job.id)
+        self.assertIsNotNone(completed_job)
         self.assertEqual(completed_job.status, JobStatus.SUCCEEDED)
         self.assertIsNotNone(completed_job.result_payload)
 
@@ -83,6 +83,30 @@ class TestReconcilerScaleToZero(unittest.IsolatedAsyncioTestCase):
         updated_pod = db.get_pod(pod.id)
         self.assertEqual(updated_pod.state, PodState.TERMINATED)
         self.assertGreater(updated_pod.total_billed_seconds, 0)
+
+    async def test_reconcile_orphaned_pods_recovery(self):
+        # Insert a pod that exists locally in DB but is abandoned/missing on provider
+        from gpuship.models import Pod
+        stale_pod_id = f"stale_pod_{uuid.uuid4().hex[:6]}"
+        db.create_pod(Pod(
+            id=stale_pod_id,
+            service_id=self.service_id,
+            deployment_id="dep_stale",
+            provider="lium",
+            lium_pod_id="non_existent_on_provider",
+            gpu_type="rtx4090",
+            port=8000,
+            state=PodState.READY,
+            rented_at=time.time() - 100.0,
+            idle_started_at=time.time() - 50.0
+        ))
+
+        # Run orphan reconciliation
+        await self.reconciler.reconcile_orphaned_pods()
+
+        # The stale pod must be cleanly marked TERMINATED
+        recovered_pod = db.get_pod(stale_pod_id)
+        self.assertEqual(recovered_pod.state, PodState.TERMINATED)
 
 if __name__ == "__main__":
     unittest.main()
